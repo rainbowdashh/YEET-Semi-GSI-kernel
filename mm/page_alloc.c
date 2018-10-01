@@ -63,7 +63,7 @@
 #include <linux/sched/rt.h>
 #include <linux/page_owner.h>
 #include <linux/kthread.h>
-#include <linux/memcontrol.h>
+#include <linux/simple_lmk.h>
 
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
@@ -125,18 +125,31 @@ unsigned long totalcma_pages __read_mostly;
 int percpu_pagelist_fraction;
 gfp_t gfp_allowed_mask __read_mostly = GFP_BOOT_MASK;
 
-#ifdef CONFIG_PTRACK_DEBUG
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+struct page_alloc_req {
+	gfp_t gfp_mask;
+	unsigned int order;
+	int alloc_flags;
+	struct alloc_context *ac;
+	struct list_head list;
+	struct page *new_page;
+	struct completion *alloc_done;
+};
 
-#define PTRACK_TABLE_PAGE_ORDERS (8)
-#define PTRACK_TABLE_BYTES (PAGE_SIZE << PTRACK_TABLE_PAGE_ORDERS)
-#define PTRACK_TABLE_ENTRY_NUM (PTRACK_TABLE_BYTES/(sizeof(struct ptrack) * PTRACK_ITEM_NUM))
-#define PTRACK_CEIL(a, b) ((a + b - 1) / b)
+static LIST_HEAD(oom_reqs_queue);
+static DEFINE_SPINLOCK(oom_queue_lock);
+static atomic_t simple_lmk_refcnt = ATOMIC_INIT(0);
+#endif
 
-static int ptrack_init_on;
-struct ptrack_info ptrack_info;
-static int ptrack_size;
-
-void __init ptrack_init(void)
+/*
+ * A cached value of the page's pageblock's migratetype, used when the page is
+ * put on a pcplist. Used to avoid the pageblock migratetype lookup when
+ * freeing from pcplists in most cases, at the cost of possibly becoming stale.
+ * Also the migratetype set in the page does not necessarily match the pcplist
+ * index, e.g. page might have MIGRATE_CMA set but be on a pcplist with any
+ * other index - this ensures that it will be put on the correct CMA freelist.
+ */
+static inline int get_pcppage_migratetype(struct page *page)
 {
 	struct memblock_type *type = &memblock.memory;
 	unsigned long i, j;
@@ -3228,7 +3241,13 @@ try_this_zone:
 		page = buffered_rmqueue(ac->preferred_zoneref->zone, zone, order,
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {
-			prep_new_page(page, order, gfp_mask, alloc_flags);
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+			if (page->reserved_for_lmk && !ac->is_lmk_alloc)
+				goto try_this_zone;
+#endif
+
+			if (prep_new_page(page, order, gfp_mask, alloc_flags))
+				goto try_this_zone;
 
 			/*
 			 * If this is a high-order atomic allocation then check
@@ -3770,13 +3789,14 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	struct page *page = NULL;
 	unsigned int alloc_flags;
 	unsigned long did_some_progress;
-	enum compact_priority compact_priority;
-	enum compact_result compact_result;
-	int compaction_retries;
-	int no_progress_loops;
-	unsigned long alloc_start = jiffies;
-	unsigned int stall_timeout = 10 * HZ;
-	unsigned int cpuset_mems_cookie;
+	enum migrate_mode migration_mode = MIGRATE_ASYNC;
+	bool deferred_compaction = false;
+	int contended_compaction = COMPACT_CONTENDED_NONE;
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+	DECLARE_COMPLETION_ONSTACK(alloc_done);
+	struct page_alloc_req pg_req;
+	unsigned long flags;
+#endif
 
 	/*
 	 * In the slowpath, we sanity check order to avoid ever trying to
@@ -3968,10 +3988,67 @@ retry:
 	 * implementation of the compaction depends on the sufficient amount
 	 * of free memory (see __compaction_suitable)
 	 */
-	if (did_some_progress > 0 &&
-			should_compact_retry(ac, order, alloc_flags,
-				compact_result, &compact_priority,
-				&compaction_retries))
+	if (!is_thp_gfp_mask(gfp_mask) || (current->flags & PF_KTHREAD))
+		migration_mode = MIGRATE_SYNC_LIGHT;
+
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+	if (gfp_mask & __GFP_NORETRY)
+		goto noretry;
+
+	ac->is_lmk_alloc = true;
+	pg_req.gfp_mask = gfp_mask;
+	pg_req.order = order;
+	pg_req.alloc_flags = alloc_flags | ALLOC_NO_WATERMARKS;
+	pg_req.ac = ac;
+	pg_req.new_page = NULL;
+	pg_req.alloc_done = &alloc_done;
+
+	spin_lock_irqsave(&oom_queue_lock, flags);
+	list_add_tail(&pg_req.list, &oom_reqs_queue);
+	spin_unlock_irqrestore(&oom_queue_lock, flags);
+
+	atomic_inc(&simple_lmk_refcnt);
+
+	/* Keep performing memory reclaim until we get our memory */
+	while (1) {
+		long ret;
+
+		simple_lmk_force_reclaim();
+		ret = wait_for_completion_killable_timeout(&alloc_done,
+							LMK_OOM_TIMEOUT);
+		if (ret) {
+			if (ret == -ERESTARTSYS) {
+				/* Give up since this process is dying */
+				spin_lock_irqsave(&oom_queue_lock, flags);
+				if (!pg_req.new_page)
+					list_del(&pg_req.list);
+				spin_unlock_irqrestore(&oom_queue_lock, flags);
+			}
+			break;
+		}
+	}
+
+	atomic_dec(&simple_lmk_refcnt);
+	page = pg_req.new_page;
+	goto got_pg;
+#endif
+
+	/* Try direct reclaim and then allocating */
+	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
+							&did_some_progress);
+	if (page)
+		goto got_pg;
+
+	/* Do not loop if specifically requested */
+	if (gfp_mask & __GFP_NORETRY)
+		goto noretry;
+
+	/* Keep reclaiming pages as long as there is reasonable progress */
+	pages_reclaimed += did_some_progress;
+	if ((did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER) ||
+	    ((gfp_mask & __GFP_REPEAT) && pages_reclaimed < (1 << order))) {
+		/* Wait for some write requests to complete then retry */
+		wait_iff_congested(ac->preferred_zone, BLK_RW_ASYNC, HZ/50);
 		goto retry;
 
 	/*
@@ -4151,13 +4228,53 @@ unsigned long get_zeroed_page(gfp_t gfp_mask)
 }
 EXPORT_SYMBOL(get_zeroed_page);
 
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+static void simple_lmk_fulfill_reqs(void)
+{
+	struct page_alloc_req *pg_req, *tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&oom_queue_lock, flags);
+	list_for_each_entry_safe(pg_req, tmp, &oom_reqs_queue, list) {
+		struct page *new_page;
+
+		new_page = get_page_from_freelist(pg_req->gfp_mask,
+							pg_req->order,
+							pg_req->alloc_flags,
+							pg_req->ac);
+		if (!new_page)
+			continue;
+
+		pg_req->new_page = new_page;
+		list_del(&pg_req->list);
+		complete(pg_req->alloc_done);
+	}
+	spin_unlock_irqrestore(&oom_queue_lock, flags);
+}
+#endif
+
 void __free_pages(struct page *page, unsigned int order)
 {
 	if (put_page_testzero(page)) {
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+		bool is_system_oom = atomic_read(&simple_lmk_refcnt);
+
+		/* Reserve this page to see if it'll fulfill an OOM'd request */
+		if (is_system_oom)
+			page->reserved_for_lmk = true;
+#endif
+
 		if (order == 0)
 			free_hot_cold_page(page, false);
 		else
 			__free_pages_ok(page, order);
+
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+		if (is_system_oom) {
+			simple_lmk_fulfill_reqs();
+			page->reserved_for_lmk = false;
+		}
+#endif
 	}
 }
 
