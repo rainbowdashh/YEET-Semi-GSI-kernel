@@ -248,8 +248,8 @@ struct page {
 	int _last_cpupid;
 #endif
 
-#ifdef CONFIG_ANDROID_SIMPLE_LMK
-	bool reserved_for_lmk;
+#ifdef CONFIG_PTRACK_DEBUG
+	struct ptrack *ptrack;
 #endif
 }
 /*

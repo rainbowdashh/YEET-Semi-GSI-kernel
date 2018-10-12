@@ -46,7 +46,7 @@
 #include <linux/oom.h>
 #include <linux/prefetch.h>
 #include <linux/printk.h>
-#include <linux/simple_lmk.h>
+#include <linux/dax.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -3473,9 +3473,6 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 {
 	long remaining = 0;
 	DEFINE_WAIT(wait);
-#ifdef CONFIG_ANDROID_SIMPLE_LMK
-	bool kswapd_slept = false;
-#endif
 
 	if (freezing(current) || kthread_should_stop())
 		return;
@@ -3483,13 +3480,7 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	prepare_to_wait(&pgdat->kswapd_wait, &wait, TASK_INTERRUPTIBLE);
 
 	/* Try to sleep for a short interval */
-	if (prepare_kswapd_sleep(pgdat, order, remaining,
-						balanced_classzone_idx)) {
-#ifdef CONFIG_ANDROID_SIMPLE_LMK
-		simple_lmk_stop_reclaim();
-		kswapd_slept = true;
-#endif
-
+	if (prepare_kswapd_sleep(pgdat, reclaim_order, classzone_idx)) {
 		/*
 		 * Compaction records what page blocks it recently failed to
 		 * isolate pages from and skips them in the future scanning.
@@ -3543,11 +3534,6 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 
 		set_pgdat_percpu_threshold(pgdat, calculate_pressure_threshold);
 	} else {
-#ifdef CONFIG_ANDROID_SIMPLE_LMK
-		/* Start reclaim when kswapd wakes and a wmark is hit quickly */
-		if (kswapd_slept)
-			simple_lmk_start_reclaim();
-#endif
 		if (remaining)
 			count_vm_event(KSWAPD_LOW_WMARK_HIT_QUICKLY);
 		else

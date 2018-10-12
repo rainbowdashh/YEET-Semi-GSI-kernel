@@ -2208,10 +2208,15 @@ struct task_struct {
 	struct task_integrity *integrity;
 #endif
 	int pagefault_disabled;
-	atomic64_t *concurrent_active_time;
-	atomic64_t *concurrent_policy_time;
-#ifdef CONFIG_ANDROID_SIMPLE_LMK
-	bool lmk_sigkill_sent;
+#ifdef CONFIG_MMU
+	struct task_struct *oom_reaper_list;
+#endif
+#ifdef CONFIG_VMAP_STACK
+	struct vm_struct *stack_vm_area;
+#endif
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	/* A live task holds one reference. */
+	atomic_t stack_refcount;
 #endif
 /* CPU-specific state of this task */
 	struct thread_struct thread;
